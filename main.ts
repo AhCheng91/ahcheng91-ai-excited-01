@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// entry.jpg: One Frame Among Thousands, 1024x683 pixels
 const INPUT = 'entry.jpg';
 const MAX_BYTES = 1048576;
 const MAX_DIMENSION = 1024;
