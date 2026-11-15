@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const MAX_BYTES = 1048576;
 const MAX_DIM = 1024;
+// entry.jpg: One Frame Among Thousands, 1024 by 683 pixels
 const INPUT = 'entry.jpg';
 
 const here = dirname(fileURLToPath(import.meta.url));
