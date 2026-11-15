@@ -1,78 +1,77 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-const inputPath = path.join(moduleDir, 'entry.jpg');
-
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const outputPath = path.join(outputDir, 'entry.png');
 
 const MAX_BYTES = 1048576;
 const MAX_DIM = 1024;
+const INPUT = 'entry.jpg';
 
-function fail(rule, detail) {
-  throw new Error(`${rule} rule failed: ${detail}`);
+const here = dirname(fileURLToPath(import.meta.url));
+const data = await readFile(join(here, INPUT));
+
+if (data[0] !== 0xff || data[1] !== 0xd8 || data[2] !== 0xff) {
+  throw new Error('rule: entry.jpg must start with the JPEG magic bytes FF D8 FF');
 }
-
-const data = await readFile(inputPath);
-
-if (data.length < 3 || data[0] !== 0xff || data[1] !== 0xd8 || data[2] !== 0xff) {
-  fail('magic bytes', 'entry.jpg must start with the JPEG magic bytes FF D8 FF');
-}
-
 if (data.length > MAX_BYTES) {
-  fail('size', `entry.jpg is ${data.length} bytes, more than the ${MAX_BYTES}-byte limit`);
+  throw new Error(`rule: entry.jpg must be at most ${MAX_BYTES} bytes (got ${data.length})`);
 }
 
-function isSof(marker) {
-  return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
-}
-
+let width = 0;
+let height = 0;
+let sawFrameHeader = false;
 let pos = 2;
-let frame = null;
 
 while (pos < data.length) {
   if (data[pos] !== 0xff) {
-    fail('marker walk', `expected 0xff marker byte at offset ${pos}`);
+    throw new Error('rule: malformed JPEG, expected a 0xFF segment prefix');
   }
-  while (pos < data.length && data[pos] === 0xff) pos++;
-  if (pos >= data.length) fail('end of file', 'unexpected end of file while reading a marker');
-  const marker = data[pos];
-  pos++;
+  let marker = data[pos + 1];
+  while (marker === 0xff && pos + 1 < data.length) {
+    pos += 1;
+    marker = data[pos + 1];
+  }
+  if (pos + 1 >= data.length || marker === undefined || marker === 0xff) {
+    throw new Error('unexpected end of file while searching for a JPEG marker');
+  }
+  pos += 2;
 
-  if (marker === 0xd9) break;
+  if (marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0xd8 || marker === 0x01) {
+    continue;
+  }
 
-  if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+  if (pos + 1 >= data.length) {
+    throw new Error('unexpected end of file while reading a JPEG segment length');
+  }
+  const len = data.readUInt16BE(pos);
+  if (len < 2) {
+    throw new Error('rule: malformed JPEG segment length at offset ' + pos);
+  }
 
-  if (pos + 2 > data.length) fail('end of file', 'unexpected end of file while reading a segment length');
-  const segLen = data.readUInt16BE(pos);
-  if (segLen < 2) fail('marker walk', `segment length ${segLen} is too small at offset ${pos}`);
-  const payloadStart = pos + 2;
-  const payloadEnd = payloadStart + segLen - 2;
-  if (payloadEnd > data.length) fail('end of file', 'unexpected end of file inside a segment');
+  const end = pos + len;
+  if (end > data.length) {
+    throw new Error('unexpected end of file: JPEG segment at offset ' + pos + ' runs past the end of the file');
+  }
 
-  if (isSof(marker)) {
-    if (payloadEnd - payloadStart < 6) fail('frame header', 'SOF segment is too short');
-    const height = data.readUInt16BE(payloadStart + 1);
-    const width = data.readUInt16BE(payloadStart + 3);
-    frame = { width, height };
+  if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+    if (len < 8) {
+      throw new Error('rule: malformed JPEG frame header');
+    }
+    sawFrameHeader = true;
+    height = data.readUInt16BE(pos + 3);
+    width = data.readUInt16BE(pos + 5);
     break;
   }
 
-  pos = payloadEnd;
+  pos = end;
 }
 
-if (frame === null) {
-  fail('frame header', 'no frame header (SOF marker) found in entry.jpg');
+if (!sawFrameHeader) {
+  throw new Error('rule: no JPEG frame header (SOF) found in entry.jpg');
+}
+if (width > MAX_DIM || height > MAX_DIM) {
+  throw new Error(`rule: image dimensions ${width}x${height} must be at most ${MAX_DIM}x${MAX_DIM} pixels`);
 }
 
-if (frame.width > MAX_DIM) {
-  fail('dimensions', `frame width ${frame.width} exceeds the ${MAX_DIM}-pixel limit`);
-}
-if (frame.height > MAX_DIM) {
-  fail('dimensions', `frame height ${frame.height} exceeds the ${MAX_DIM}-pixel limit`);
-}
-
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 await mkdir(outputDir, { recursive: true });
-await writeFile(outputPath, data);
+await writeFile(join(outputDir, 'entry.png'), data);

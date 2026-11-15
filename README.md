@@ -8,6 +8,6 @@ A lone person stands in a small red rowboat on a dawn sea while an enormous colu
 
 ## Run it
 
-```
+```sh
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
