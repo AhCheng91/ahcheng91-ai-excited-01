@@ -1,230 +1,206 @@
-// Whale at Platform Two — a whale bursts up through a crowded subway platform, seawater and tiles exploding into the concourse.
+// Whale in the Midnight Street — an enormous whale breaches out of a rain-soaked street, water exploding through the streetlight glow.
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+const ENTRY_FILE = 'entry.jpg';
+const OUTPUT_FILE = 'entry.png';
 
 const MAX_FILE_BYTES = 1048576;
-const MAX_FRAME_DIMENSION = 1024;
-const JPEG_MAGIC = [0xff, 0xd8, 0xff];
+const MAX_FRAME_SIDE = 1024;
 
-const MARKER_NAMES: Record<number, string> = {
-  0xc0: "SOF0 (baseline DCT)",
-  0xc1: "SOF1 (extended sequential DCT)",
-  0xc2: "SOF2 (progressive DCT)",
-  0xc3: "SOF3 (lossless)",
-  0xc4: "DHT (define Huffman table)",
-  0xc5: "SOF5 (differential sequential DCT)",
-  0xc6: "SOF6 (differential progressive DCT)",
-  0xc7: "SOF7 (differential lossless)",
-  0xc8: "JPG (reserved for JPEG extensions)",
-  0xc9: "SOF9 (extended sequential, arithmetic)",
-  0xca: "SOF10 (progressive, arithmetic)",
-  0xcb: "SOF11 (lossless, arithmetic)",
-  0xcc: "DAC (define arithmetic conditioning)",
-  0xcd: "SOF13 (differential sequential, arithmetic)",
-  0xce: "SOF14 (differential progressive, arithmetic)",
-  0xcf: "SOF15 (differential lossless, arithmetic)",
-  0xda: "SOS (start of scan)",
-  0xd9: "EOI (end of image)",
-};
+const SOF0 = 0xc0;
+const SOF15 = 0xcf;
 
-const STANDALONE_MARKERS = new Set<number>([
+const skipTable = new Set([
   0x01,
-  0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7,
   0xd8,
-  0xd9,
 ]);
 
-const SOF_MARKERS = new Set<number>([
-  0xc0, 0xc1, 0xc2, 0xc3,
-  0xc5, 0xc6, 0xc7,
-  0xc9, 0xca, 0xcb,
-  0xcd, 0xce, 0xcf,
+const lengthTable = new Set([
+  0xc4,
+  0xcc,
 ]);
 
-type Frame = {
-  marker: number;
-  precision: number;
-  width: number;
-  height: number;
-};
+function readUint16BE(bytes, offset) {
+  return bytes[offset] * 256 + bytes[offset + 1];
+}
 
 class RuleError extends Error {
-  constructor(rule: string, detail: string) {
-    super(`Rule failed: ${rule} — ${detail}`);
-    this.name = "RuleError";
+  constructor(rule, detail) {
+    const suffix = detail ? ` — ${detail}` : '';
+    super(`rule ${rule}${suffix}`);
+    this.name = 'RuleError';
+    this.rule = rule;
   }
 }
 
-function rule(ruleName: string, ok: boolean, detail: string): void {
+function validateMagic(bytes) {
+  const ok =
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff;
   if (!ok) {
-    throw new RuleError(ruleName, detail);
+    throw new RuleError('magic', 'file must start with JPEG bytes FF D8 FF');
   }
 }
 
-async function readEntryFile(directory: string): Promise<Buffer> {
-  const entryPath = join(directory, "entry.jpg");
-  return await readFile(entryPath);
-}
-
-function validateMagic(data: Buffer): void {
-  rule(
-    "JPEG_MAGIC",
-    data.length >= 3 &&
-      data[0] === JPEG_MAGIC[0] &&
-      data[1] === JPEG_MAGIC[1] &&
-      data[2] === JPEG_MAGIC[2],
-    `the file must begin with the JPEG start-of-image marker FF D8 FF, found ${describeBytes(data, 3)}`,
-  );
-}
-
-function validateLength(data: Buffer): void {
-  rule(
-    "FILE_LENGTH",
-    data.length <= MAX_FILE_BYTES,
-    `the file is ${data.length} bytes but the limit ${MAX_FILE_BYTES} is exceeded`,
-  );
-}
-
-function describeBytes(data: Buffer, count: number): string {
-  const hex: string[] = [];
-  const take = Math.min(count, data.length);
-  for (let i = 0; i < take; i++) {
-    hex.push(data[i].toString(16).padStart(2, "0"));
+function validateSize(bytes) {
+  if (bytes.length > MAX_FILE_BYTES) {
+    throw new RuleError(
+      'size',
+      `file is ${bytes.length} bytes, limit is ${MAX_FILE_BYTES}`,
+    );
   }
-  return `[${hex.join(" ")}]`;
 }
 
-function collectFrames(data: Buffer): Frame[] {
-  const frames: Frame[] = [];
-  let index = 2;
-
-  rule("SEGMENT_START", index <= data.length, "the byte stream is shorter than the start-of-image marker");
-
-  while (index + 1 < data.length) {
-    rule(
-      "MARKER_SYNTAX",
-      data[index] === 0xff,
-      `every segment must begin with 0xFF at offset ${index}, found ${describeBytes(data, index + 3)}`,
-    );
-
-    while (index < data.length && data[index] === 0xff) {
-      index++;
-    }
-    rule("MARKER_SYNTAX", index < data.length, "a marker run continues past the end of the file");
-
-    const marker = data[index];
-
-    rule(
-      "MARKER_SYNTAX",
-      marker !== 0x00 && marker !== 0xff,
-      `marker 0x${marker.toString(16).padStart(2, "0")} is not an allowed segment code at offset ${index - 1}`,
-    );
-
-    if (STANDALONE_MARKERS.has(marker)) {
-      index++;
+function scanDataNextMarker(bytes, start) {
+  let i = start;
+  while (i + 1 < bytes.length) {
+    if (bytes[i] !== 0xff) {
+      i += 1;
       continue;
     }
+    const next = bytes[i + 1];
+    if (next === 0x00 || next === 0xff) {
+      i += 2;
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
 
-    if (marker === 0xda) {
+function parseFrameDimensions(bytes) {
+  if (bytes.length < 4) {
+    throw new RuleError('dimension', 'too short to walk marker segments');
+  }
+  let offset = 2;
+  let maxHeight = 0;
+  let maxWidth = 0;
+  while (offset + 2 <= bytes.length) {
+    const marker = bytes[offset];
+    if (marker !== 0xff) {
+      throw new RuleError(
+        'dimension',
+        `expected marker prefix FF at offset ${offset}, found 0x${marker.toString(16)}`,
+      );
+    }
+    let code = bytes[offset + 1];
+    let segStart = offset + 2;
+    if (code === 0xff) {
+      while (code === 0xff && segStart < bytes.length) {
+        code = bytes[segStart];
+        segStart += 1;
+      }
+    }
+    if (segStart > bytes.length) {
+      throw new RuleError('dimension', 'ran out of bytes while skipping fill bytes');
+    }
+    if (code === 0xd9 || code === 0x00) {
       break;
     }
-
-    if (index + 3 >= data.length) {
-      throw new RuleError(
-        "SEGMENT_LENGTH",
-        `marker ${markerName(marker)} at offset ${index} has no room for its length field`,
-      );
+    if (skipTable.has(code)) {
+      offset = segStart;
+      continue;
     }
-
-    const segmentLength = (data[index + 1] << 8) | data[index + 2];
-
-    rule(
-      "SEGMENT_LENGTH",
-      segmentLength >= 2,
-      `marker ${markerName(marker)} declares the impossible length ${segmentLength} (must be at least 2)`,
-    );
-
-    const payloadStart = index + 3;
-    const payloadEnd = payloadStart + (segmentLength - 2);
-
-    rule(
-      "SEGMENT_LENGTH",
-      payloadEnd <= data.length,
-      `marker ${markerName(marker)} at offset ${index} ends at ${payloadEnd} which runs past the ${data.length}-byte file`,
-    );
-
-    if (SOF_MARKERS.has(marker)) {
-      rule(
-        "FRAME_SEGMENT",
-        segmentLength >= 8,
-        `frame marker ${markerName(marker)} at offset ${index} is only ${segmentLength} bytes; at least 8 are needed for a frame header`,
-      );
-
-      const precision = data[payloadStart];
-      const height = (data[payloadStart + 1] << 8) | data[payloadStart + 2];
-      const width = (data[payloadStart + 3] << 8) | data[payloadStart + 4];
-
-      frames.push({ marker, precision, width, height });
+    if (segStart + 2 > bytes.length) {
+      throw new RuleError('dimension', 'segment length field truncated');
     }
-
-    index = payloadEnd;
+    const segLen = readUint16BE(bytes, segStart);
+    if (segLen < 2) {
+      throw new RuleError('dimension', `segment 0x${code.toString(16)} has invalid length ${segLen}`);
+    }
+    const isSOF = code >= SOF0 && code <= SOF15 && !lengthTable.has(code);
+    if (isSOF) {
+      if (segStart + 7 > bytes.length) {
+        throw new RuleError('dimension', 'SOF segment truncated');
+      }
+      const precision = bytes[segStart + 2];
+      if (precision !== 0xff) {
+        const height = readUint16BE(bytes, segStart + 3);
+        const width = readUint16BE(bytes, segStart + 5);
+        if (height > maxHeight) {
+          maxHeight = height;
+        }
+        if (width > maxWidth) {
+          maxWidth = width;
+        }
+      }
+      offset = segStart + segLen;
+      continue;
+    }
+    if (code === 0xda) {
+      const next = scanDataNextMarker(bytes, segStart + segLen);
+      if (next === -1) {
+        break;
+      }
+      offset = next;
+      continue;
+    }
+    offset = segStart + segLen;
   }
-
-  return frames;
+  if (maxHeight === 0 || maxWidth === 0) {
+    return null;
+  }
+  return { height: maxHeight, width: maxWidth };
 }
 
-function validateDimensions(data: Buffer, frames: Frame[]): void {
-  rule("FRAME_COUNT", frames.length >= 1, "no start-of-frame marker was found before the start of scan");
-
-  for (const frame of frames) {
-    rule(
-      "FRAME_SIZE",
-      frame.width <= MAX_FRAME_DIMENSION,
-      `frame ${markerName(frame.marker)} is ${frame.width} pixels wide, but the limit is ${MAX_FRAME_DIMENSION}`,
-    );
-
-    rule(
-      "FRAME_SIZE",
-      frame.height <= MAX_FRAME_DIMENSION,
-      `frame ${markerName(frame.marker)} is ${frame.height} pixels high, but the limit is ${MAX_FRAME_DIMENSION}`,
+function validateDimension(bytes) {
+  const frame = parseFrameDimensions(bytes);
+  if (frame === null) {
+    throw new RuleError('dimension', 'no frame segment found');
+  }
+  if (frame.height > MAX_FRAME_SIDE || frame.width > MAX_FRAME_SIDE) {
+    throw new RuleError(
+      'dimension',
+      `frame is ${frame.width}x${frame.height}, limit is ${MAX_FRAME_SIDE} per side`,
     );
   }
 }
 
-function markerName(marker: number): string {
-  return MARKER_NAMES[marker] ?? `0x${marker.toString(16).padStart(2, "0")}`;
+function outputDirectory() {
+  const dir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  return resolve(dir);
 }
 
-function outputDirectory(): string {
-  return process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-}
+async function main() {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const entryPath = join(moduleDir, ENTRY_FILE);
+  const outDir = outputDirectory();
+  const outPath = join(outDir, OUTPUT_FILE);
 
-async function writeOutput(directory: string, data: Buffer): Promise<void> {
-  await mkdir(directory, { recursive: true });
-  const outputPath = join(directory, "entry.png");
-  await writeFile(outputPath, data);
-}
-
-async function main(): Promise<void> {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const bytes = await readEntryFile(here);
+  let bytes;
+  try {
+    bytes = await readFile(entryPath);
+  } catch (error) {
+    throw new RuleError('source', `cannot read ${entryPath}: ${error.message}`);
+  }
 
   validateMagic(bytes);
-  validateLength(bytes);
+  validateSize(bytes);
+  validateDimension(bytes);
 
-  const frames = collectFrames(bytes);
-  validateDimensions(bytes, frames);
+  try {
+    await mkdir(outDir, { recursive: true });
+  } catch (error) {
+    throw new RuleError('output', `cannot create ${outDir}: ${error.message}`);
+  }
 
-  await writeOutput(outputDirectory(), bytes);
+  try {
+    await writeFile(outPath, bytes);
+  } catch (error) {
+    throw new RuleError('output', `cannot write ${outPath}: ${error.message}`);
+  }
+
+  const frame = parseFrameDimensions(bytes) ?? { width: 0, height: 0 };
+  console.log(
+    `Wrote ${outPath} (${bytes.length} bytes, ${frame.width}x${frame.height})`,
+  );
 }
 
-main().catch((error: unknown) => {
-  if (error instanceof Error) {
-    console.error(error.message);
-  } else {
-    console.error(String(error));
-  }
-  process.exitCode = 1;
+main().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
 });
