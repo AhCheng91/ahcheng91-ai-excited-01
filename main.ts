@@ -1,225 +1,192 @@
-// A Hummingbird the Size of a Car — a giant hummingbird hovers at a lonely gas station pump at dusk.
-
+// Made You Look — a herd of horses made of pouring sand bursts out of a sandbox while a girl holds up the sign.
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import process from "node:process";
 
-const INPUT_NAME = "entry.jpg";
-const OUTPUT_NAME = "entry.png";
-const MAX_FILE_BYTES = 1048576;
-const MAX_FRAME_SIDE = 1024;
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const IMAGE_FILE = join(MODULE_DIR, "entry.jpg");
+const OUTPUT_FILE = "entry.png";
+const MAX_BYTES = 1048576;
+const MAX_DIMENSION = 1024;
+const DEFAULT_OUTPUT_DIR = "/output";
 
-const SOI = 0xd8;
-const EOI = 0xd9;
-const SOS = 0xda;
-const TEM = 0x01;
+const MARKER_SOI = 0xd8;
+const MARKER_EOI = 0xd9;
+const MARKER_SOS = 0xda;
+const MARKER_TEM = 0x01;
 
-const SOF_MARKERS = new Set([
-  0xc0,
-  0xc1,
-  0xc2,
-  0xc3,
-  0xc5,
-  0xc6,
-  0xc7,
-  0xc9,
-  0xca,
-  0xcb,
-  0xcd,
-  0xce,
-  0xcf,
-]);
-
-class RuleError extends Error {
-  constructor(rule, message) {
-    super(`rule "${rule}" failed: ${message}`);
-    this.name = "RuleError";
-    this.rule = rule;
-  }
+function ruleError(name, message) {
+  const error = new Error(`Rule failed: ${name}. ${message}`);
+  error.name = `RuleFailed_${name}`;
+  return error;
 }
 
-function readUint16(buffer, offset) {
-  return (buffer[offset] << 8) | buffer[offset + 1];
+const ERRORS = {
+  magic: ruleError(
+    "magic-bytes",
+    "entry.jpg does not begin with the JPEG start-of-image marker FF D8 FF.",
+  ),
+  length: ruleError(
+    "file-size",
+    "entry.jpg is longer than the allowed 1048576 bytes.",
+  ),
+  dimension: ruleError(
+    "frame-dimensions",
+    "entry.jpg contains a frame wider or taller than the allowed 1024 pixels.",
+  ),
+  structure: ruleError(
+    "jpeg-structure",
+    "entry.jpg could not be walked as a well-formed JPEG stream.",
+  ),
+  output: ruleError(
+    "output-directory",
+    "the output directory could not be created.",
+  ),
+  write: ruleError(
+    "output-write",
+    "the entry.png file could not be written.",
+  ),
+};
+
+function hasLengthField(marker) {
+  if (marker === MARKER_TEM) return false;
+  if (marker >= 0xd0 && marker <= 0xd7) return false;
+  return true;
 }
 
-function checkFileSize(buffer) {
-  if (buffer.length > MAX_FILE_BYTES) {
-    throw new RuleError(
-      "file-size",
-      `entry.jpg is ${buffer.length} bytes but the limit is ${MAX_FILE_BYTES}`
-    );
-  }
+function isStartOfFrame(marker) {
+  if (marker < 0xc0 || marker > 0xcf) return false;
+  if (marker === 0xc4 || marker === 0xc8 || marker === 0xcc) return false;
+  return true;
 }
 
-function checkJpegMagic(buffer) {
-  if (buffer.length < 3) {
-    throw new RuleError(
-      "jpeg-magic",
-      `file is too short to start with FF D8 FF (only ${buffer.length} bytes)`
-    );
-  }
-  if (buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) {
-    throw new RuleError(
-      "jpeg-magic",
-      `expected FF D8 FF but found ${buffer.slice(0, 3).toString("hex")}`
-    );
-  }
+function readUint16(bytes, offset) {
+  return (bytes[offset] << 8) | bytes[offset + 1];
 }
 
-function checkOutputPath(outputDirectory, inputPath) {
-  if (outputDirectory.trim().length === 0) {
-    throw new RuleError(
-      "output-path",
-      "MAKEFUN_OUTPUT_DIR must not be empty"
-    );
-  }
-  const absoluteOutputDirectory = resolve(outputDirectory.trim());
-  if (absoluteOutputDirectory === "/") {
-    throw new RuleError(
-      "output-path",
-      "refusing to write into the filesystem root"
-    );
-  }
-  const outputPath = join(absoluteOutputDirectory, OUTPUT_NAME);
-  if (outputPath === inputPath) {
-    throw new RuleError(
-      "output-path",
-      "refusing to overwrite the input image"
-    );
-  }
-  return outputPath;
+function readFrameGeometry(bytes, offset) {
+  const height = readUint16(bytes, offset + 5);
+  const width = readUint16(bytes, offset + 7);
+  return { width, height };
 }
 
-function checkFrames(buffer) {
-  let offset = 2;
-  let largestWidth = 0;
-  let largestHeight = 0;
-
-  while (offset < buffer.length) {
-    if (buffer[offset] !== 0xff) {
-      throw new RuleError(
-        "frame-dimension",
-        `expected a 0xFF marker at offset ${offset}`
-      );
+function skipEntropyData(bytes, index) {
+  while (index + 1 < bytes.length) {
+    const byte = bytes[index];
+    if (byte !== 0xff) {
+      index += 1;
+      continue;
     }
-    const code = buffer[offset + 1];
-    offset += 2;
+    const next = bytes[index + 1];
+    if (next === 0x00) {
+      index += 2;
+      continue;
+    }
+    if (next >= 0xd0 && next <= 0xd7) {
+      index += 2;
+      continue;
+    }
+    return index;
+  }
+  return index;
+}
 
-    if (code === EOI) {
+function walkFrames(bytes) {
+  let index = 2;
+  let width = 0;
+  let height = 0;
+  while (index + 1 < bytes.length) {
+    const markerByte = bytes[index];
+    if (markerByte !== 0xff) {
+      throw ERRORS.structure;
+    }
+    const marker = bytes[index + 1];
+    if (marker === MARKER_EOI) {
       break;
     }
-
-    if (code === SOS) {
-      if (offset + 2 > buffer.length) {
-        throw new RuleError(
-          "frame-dimension",
-          "SOS length field runs past the end of the file"
-        );
-      }
-      const segmentLength = readUint16(buffer, offset);
-      if (segmentLength < 2) {
-        throw new RuleError(
-          "frame-dimension",
-          `SOS segment declares an implausible length of ${segmentLength}`
-        );
-      }
-      offset += segmentLength;
-      while (offset + 1 < buffer.length) {
-        const byte = buffer[offset];
-        if (byte !== 0xff) {
-          offset += 1;
-          continue;
-        }
-        const next = buffer[offset + 1];
-        if (next === 0xff) {
-          offset += 1;
-          continue;
-        }
-        if (next === 0x00) {
-          offset += 2;
-          continue;
-        }
-        break;
-      }
+    if (marker === MARKER_SOI) {
+      throw ERRORS.structure;
+    }
+    if (!hasLengthField(marker)) {
+      index += 2;
       continue;
     }
-
-    if (code === TEM || (code >= 0xd0 && code <= 0xd7)) {
-      continue;
-    }
-
-    if (offset + 2 > buffer.length) {
-      throw new RuleError(
-        "frame-dimension",
-        "segment length field runs past the end of the file"
-      );
-    }
-    const segmentLength = readUint16(buffer, offset);
+    const segmentLength = readUint16(bytes, index + 2);
     if (segmentLength < 2) {
-      throw new RuleError(
-        "frame-dimension",
-        `segment at offset ${offset - 2} declares an implausible length of ${segmentLength}`
-      );
+      throw ERRORS.structure;
     }
-    if (offset + segmentLength > buffer.length) {
-      throw new RuleError(
-        "frame-dimension",
-        `segment at offset ${offset - 2} overruns the file by ${
-          offset + segmentLength - buffer.length
-        } bytes`
-      );
+    if (marker === MARKER_SOS) {
+      index += 2 + segmentLength;
+      index = skipEntropyData(bytes, index);
+      continue;
     }
-
-    if (SOF_MARKERS.has(code)) {
-      if (segmentLength < 7) {
-        throw new RuleError(
-          "frame-dimension",
-          `SOF segment at offset ${offset - 2} is too short to hold a frame header`
-        );
+    if (isStartOfFrame(marker)) {
+      if (segmentLength < 8) {
+        throw ERRORS.structure;
       }
-      const height = readUint16(buffer, offset + 3);
-      const width = readUint16(buffer, offset + 5);
-      if (height > largestHeight) {
-        largestHeight = height;
-      }
-      if (width > largestWidth) {
-        largestWidth = width;
-      }
+      const geometry = readFrameGeometry(bytes, index + 2);
+      if (geometry.width > width) width = geometry.width;
+      if (geometry.height > height) height = geometry.height;
     }
-
-    offset += segmentLength;
+    index += 2 + segmentLength;
   }
-
-  if (largestWidth === 0 || largestHeight === 0) {
-    throw new RuleError(
-      "frame-dimension",
-      "no frame was found in the file"
-    );
-  }
-  if (largestWidth > MAX_FRAME_SIDE || largestHeight > MAX_FRAME_SIDE) {
-    throw new RuleError(
-      "frame-dimension",
-      `largest frame is ${largestWidth}x${largestHeight}; each side must be at most ${MAX_FRAME_SIDE}`
-    );
-  }
-
-  return { largestWidth, largestHeight };
+  return { width, height };
 }
 
-const moduleDirectory = dirname(fileURLToPath(import.meta.url));
-const inputPath = join(moduleDirectory, INPUT_NAME);
-const outputDirectory = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const outputPath = checkOutputPath(outputDirectory, inputPath);
+function verifyJpeg(bytes) {
+  if (bytes.length < 3) {
+    throw ERRORS.magic;
+  }
+  if (bytes[0] !== 0xff || bytes[1] !== MARKER_SOI || bytes[2] !== 0xff) {
+    throw ERRORS.magic;
+  }
+  if (bytes.length > MAX_BYTES) {
+    throw ERRORS.length;
+  }
+  const { width, height } = walkFrames(bytes);
+  if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+    throw ERRORS.dimension;
+  }
+  return { width, height };
+}
 
-const imageBytes = await readFile(inputPath);
+function resolveOutputDirectory() {
+  const configured = process.env.MAKEFUN_OUTPUT_DIR;
+  if (!configured || configured.length === 0) {
+    return DEFAULT_OUTPUT_DIR;
+  }
+  return resolve(configured);
+}
 
-checkFileSize(imageBytes);
-checkJpegMagic(imageBytes);
-const { largestWidth, largestHeight } = checkFrames(imageBytes);
+async function writeOutput(bytes, outputDirectory) {
+  try {
+    await mkdir(outputDirectory, { recursive: true });
+  } catch (cause) {
+    const error = ERRORS.output;
+    error.cause = cause;
+    throw error;
+  }
+  const destination = join(outputDirectory, OUTPUT_FILE);
+  try {
+    await writeFile(destination, bytes);
+  } catch (cause) {
+    const error = ERRORS.write;
+    error.cause = cause;
+    throw error;
+  }
+  return destination;
+}
 
-await mkdir(outputDirectory, { recursive: true });
-await writeFile(outputPath, imageBytes);
+async function main() {
+  const bytes = await readFile(IMAGE_FILE);
+  const { width, height } = verifyJpeg(bytes);
+  const outputDirectory = resolveOutputDirectory();
+  const destination = await writeOutput(bytes, outputDirectory);
+  console.log(`Wrote ${destination} (${bytes.length} bytes, frame ${width}x${height}).`);
+}
 
-console.log(
-  `verified JPEG ${largestWidth}x${largestHeight} and wrote ${imageBytes.length} bytes to ${outputPath}`
-);
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
