@@ -1,226 +1,179 @@
 // One Frame Among Thousands — a colossal cracked-gold eye over a dark arena, one picture glowing brighter than all the rest.
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
-import process from "node:process";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-// Maximum accepted size of the source JPEG, in bytes (exactly 1 MiB).
-const MAX_SOURCE_BYTES = 1048576;
+const BYTES_AT_MOST = 1048576;
+const DIMENSION_AT_MOST = 1024;
+const INPUT_NAME = "entry.jpg";
+const OUTPUT_NAME = "entry.png";
+const DEFAULT_OUTPUT_DIR = "/output";
+const ROOT = dirname(fileURLToPath(import.meta.url));
 
-// Any frame side larger than this fails the dimensions rule.
-const MAX_FRAME_SIDE = 1024;
+const RULES = Object.freeze({
+  MAGIC: "magic 0xFFD8FF",
+  LENGTH: "length at most 1048576 bytes",
+  DIMENSIONS: "frame width and height at most 1024 each",
+  FRAME: "frame marker present",
+  SEGMENT: "marker segment within file bounds",
+  READ: "source image is readable",
+});
 
-// Start-of-frame markers SOF0..SOF15. Every one of them carries a frame
-// precision byte followed by a two-byte height and a two-byte width.
-const SOF_MARKERS = new Set([
-  0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
-  0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+const SOI = 0xd8;
+const EOI = 0xd9;
+const TEM = 0x01;
+const SOS = 0xda;
+
+const STANDALONE = new Set([SOI, EOI, TEM]);
+const RESTART = new Set([0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7]);
+const SOF = new Set([
+  0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
 ]);
 
-const EOI = 0xd9;        // end of image marker
-const RST_FIRST = 0xd0;  // first restart marker
-const RST_LAST = 0xd7;   // last restart marker
-
-/**
- * Every rejected input throws an Error that names the rule it ran into, so a
- * reader can tell instantly which guard fired and why.
- * @param {string} rule Short name of the violated rule.
- * @param {string} detail Human-readable explanation of the failure.
- * @returns {never}
- */
-function fail(rule, detail) {
-  throw new Error(`rule "${rule}" failed: ${detail}`);
+function ruleError(rule, detail) {
+  return new Error(`rule failed: ${rule}${detail ? ` — ${detail}` : ""}`);
 }
 
-/**
- * True when a marker byte is one of the start-of-frame markers whose payload
- * begins with precision/height/width fields.
- * @param {number} marker Marker byte (without the preceding 0xFF).
- * @returns {boolean}
- */
-function isStartOfFrame(marker) {
-  return SOF_MARKERS.has(marker);
+function readUint16BE(buf, offset) {
+  return (buf[offset] << 8) | buf[offset + 1];
 }
 
-/**
- * Scan for the next real JPEG marker that follows entropy-coded or padding
- * data, honouring byte-stuffed 0xFF 0x00 pairs and 0xFF 0xFF fill bytes.
- * @param {Buffer} buf The whole JPEG as bytes.
- * @param {number} from Index to begin scanning at.
- * @returns {number} Index of the 0xFF that starts the next marker, or -1.
- */
-function scanToNextMarker(buf, from) {
-  let i = from;
-  while (i + 1 < buf.length) {
-    if (buf[i] !== 0xff) {
-      i += 1;
-      continue;
-    }
-    const next = buf[i + 1];
-    if (next === 0xff) {
-      // Fill byte before a marker; step over it.
-      i += 1;
-      continue;
-    }
-    if (next === 0x00) {
-      // A byte-stuffed 0xFF inside entropy-coded data.
-      i += 2;
-      continue;
-    }
-    return i;
-  }
-  if (i < buf.length && buf[i] === 0xff) {
-    return i;
-  }
-  return -1;
+function describeCode(code) {
+  return `0x${code.toString(16).padStart(2, "0")}`;
 }
 
-/**
- * Extract the frame width and height from a start-of-frame segment whose
- * 0xFF marker byte sits at {@code at}.
- * @param {Buffer} buf Whole JPEG bytes.
- * @param {number} at Index of the marker's 0xFF byte.
- * @returns {{ width: number, height: number }} The frame's width and height.
- */
-function frameSizeAt(buf, at) {
-  const height = buf.readUInt16BE(at + 5);
-  const width = buf.readUInt16BE(at + 7);
-  return { width, height };
-}
-
-/**
- * Enforce rule "magic": the source must start with JPEG SOI bytes FF D8 FF.
- * @param {Buffer} buf The source image bytes.
- * @returns {void}
- */
-function checkMagic(buf) {
-  if (buf.length < 3 || buf[0] !== 0xff || buf[1] !== 0xd8 || buf[2] !== 0xff) {
-    fail(
-      "magic",
-      `expected the JPEG marker FF D8 FF at the start, got ${buf
-        .subarray(0, Math.min(buf.length, 3))
-        .toString("hex") || "<empty>"}`,
-    );
-  }
-}
-
-/**
- * Enforce rule "length": the whole file must be at most 1048576 bytes.
- * @param {Buffer} buf The source image bytes.
- * @returns {void}
- */
-function checkLength(buf) {
-  if (buf.length > MAX_SOURCE_BYTES) {
-    fail(
-      "length",
-      `${buf.length} bytes is more than the allowed ${MAX_SOURCE_BYTES}`,
-    );
-  }
-}
-
-/**
- * Walk the whole marker stream, advancing each segment by its own length
- * field, and return the geometry of every start-of-frame marker in the file.
- *
- * A file may legitimately carry more than one frame — a hierarchical JPEG or
- * a multi-picture file — so every frame is measured, not just the first one.
- *
- * @param {Buffer} buf The source image bytes.
- * @returns {Array<{ width: number, height: number }>} Geometry of every frame.
- */
-function collectFrameSizes(buf) {
+function walkedFrames(buf) {
   const frames = [];
-  let pos = 2; // skip SOI
-  while (pos >= 0 && pos < buf.length) {
-    pos = scanToNextMarker(buf, pos);
-    if (pos < 0 || pos + 1 >= buf.length) {
-      break;
+  let pos = 2;
+  let inScan = false;
+  while (pos < buf.length) {
+    if (buf[pos] !== 0xff) {
+      if (inScan) {
+        pos += 1;
+        continue;
+      }
+      throw ruleError(RULES.SEGMENT, `expected 0xFF marker byte at offset ${pos}`);
     }
-    const code = buf[pos + 1];
-    if (code === EOI) {
-      break;
+    while (pos < buf.length && buf[pos] === 0xff) {
+      pos += 1;
     }
-    if (code === 0x01 || (code >= RST_FIRST && code <= RST_LAST)) {
-      pos += 2; // standalone markers carry no segment body
+    if (pos >= buf.length) {
+      throw ruleError(RULES.SEGMENT, "truncated marker code");
+    }
+    if (inScan && buf[pos] === 0x00) {
+      pos += 1;
       continue;
     }
-    if (pos + 3 > buf.length) {
-      fail("segment", `marker header runs past the end of the file at offset ${pos}`);
+    const code = buf[pos];
+    pos += 1;
+    if (RESTART.has(code)) {
+      continue;
     }
-    const segmentLength = buf.readUInt16BE(pos + 2);
-    if (segmentLength < 2 || pos + 2 + segmentLength > buf.length) {
-      fail(
-        "segment",
-        `segment ${code.toString(16)} at offset ${pos} claims length ` +
-          `${segmentLength}, which overruns the ${buf.length}-byte file`,
+    if (STANDALONE.has(code)) {
+      if (code === EOI) {
+        break;
+      }
+      continue;
+    }
+    if (pos + 2 > buf.length) {
+      throw ruleError(RULES.SEGMENT, `truncated length field for marker ${describeCode(code)}`);
+    }
+    const length = readUint16BE(buf, pos);
+    if (length < 2) {
+      throw ruleError(
+        RULES.SEGMENT,
+        `marker ${describeCode(code)} declares segment length ${length}, below the minimum 2`,
       );
     }
-    if (isStartOfFrame(code)) {
-      if (segmentLength < 9) {
-        fail(
-          "segment",
-          `start-of-frame marker at offset ${pos} is only ${segmentLength} ` +
-            `bytes long, too short to hold a frame geometry`,
-        );
-      }
-      frames.push(frameSizeAt(buf, pos));
+    if (pos + length > buf.length) {
+      throw ruleError(
+        RULES.SEGMENT,
+        `marker ${describeCode(code)} declares ${length} bytes but the file ends at ${buf.length}`,
+      );
     }
-    pos += 2 + segmentLength;
+    if (SOF.has(code)) {
+      if (length < 8) {
+        throw ruleError(RULES.FRAME, `start-of-frame ${describeCode(code)} is only ${length} bytes long`);
+      }
+      const precision = buf[pos + 2];
+      const height = readUint16BE(buf, pos + 3);
+      const width = readUint16BE(buf, pos + 5);
+      frames.push({ code, precision, height, width, length });
+    }
+    pos += length;
+    if (code === SOS) {
+      inScan = true;
+    }
   }
   if (frames.length === 0) {
-    fail("dimensions", "no start-of-frame marker found, so no frame to measure");
+    throw ruleError(RULES.FRAME, "no start-of-frame marker seen before end of image");
   }
   return frames;
 }
 
-/**
- * Enforce rule "dimensions": every frame in the file must be at most
- * MAX_FRAME_SIDE wide and tall.
- * @param {Array<{ width: number, height: number }>} frames Frame geometries.
- * @returns {void}
- */
-function checkDimensions(frames) {
-  for (const frame of frames) {
-    if (frame.width > MAX_FRAME_SIDE || frame.height > MAX_FRAME_SIDE) {
-      fail(
-        "dimensions",
-        `frame is ${frame.width} x ${frame.height}; each side must be at most ` +
-          `${MAX_FRAME_SIDE}`,
-      );
-    }
+function frameWithinBounds(frame) {
+  if (frame.width < 1 || frame.height < 1) {
+    throw ruleError(
+      RULES.DIMENSIONS,
+      `frame size ${frame.width}x${frame.height} has a zero dimension`,
+    );
+  }
+  if (frame.width > DIMENSION_AT_MOST || frame.height > DIMENSION_AT_MOST) {
+    throw ruleError(
+      RULES.DIMENSIONS,
+      `frame ${frame.width}x${frame.height} exceeds ${DIMENSION_AT_MOST} in width or height`,
+    );
   }
 }
 
-/**
- * Resolve the output directory: $MAKEFUN_OUTPUT_DIR when set, otherwise the
- * conventional /output directory.
- * @returns {string} The directory to write entry.png into.
- */
-function outputDirectory() {
-  const env = path.normalize(process.env.MAKEFUN_OUTPUT_DIR ?? "");
-  return env === "" || env === "." ? "/output" : env;
+async function outputTarget() {
+  const configured = process.env.MAKEFUN_OUTPUT_DIR;
+  let dir;
+  if (typeof configured === "string" && configured.length > 0) {
+    dir = configured;
+  } else {
+    dir = DEFAULT_OUTPUT_DIR;
+  }
+  return { dir, path: join(dir, OUTPUT_NAME) };
 }
 
-/**
- * Read the committed source image, verify every rule, and write the bytes out
- * unchanged as entry.png.
- * @returns {Promise<void>}
- */
 async function main() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const sourcePath = path.join(here, "entry.jpg");
-  const bytes = await readFile(sourcePath);
-  checkMagic(bytes);
-  checkLength(bytes);
-  const frames = collectFrameSizes(bytes);
-  checkDimensions(frames);
+  const inputPath = join(ROOT, INPUT_NAME);
+  let bytes;
+  try {
+    bytes = await readFile(inputPath);
+  } catch (err) {
+    throw ruleError(RULES.READ, err.message);
+  }
 
-  const outDir = outputDirectory();
-  await mkdir(outDir, { recursive: true });
-  await writeFile(path.join(outDir, "entry.png"), bytes);
+  const head = bytes.toString("hex", 0, Math.min(4, bytes.length));
+  if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
+    throw ruleError(RULES.MAGIC, `file begins with ${head}`);
+  }
+
+  if (bytes.length > BYTES_AT_MOST) {
+    throw ruleError(RULES.LENGTH, `${bytes.length} bytes exceeds ${BYTES_AT_MOST}`);
+  }
+
+  const frames = walkedFrames(bytes);
+  for (const frame of frames) {
+    frameWithinBounds(frame);
+  }
+  const frame = frames[0];
+
+  const { dir, path } = await outputTarget();
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, bytes);
+
+  console.log(`wrote ${path}`);
+  console.log(
+    `frame ${frame.width}x${frame.height} (${frame.width < 1024 ? "within" : "at"} 1024), ` +
+      `${frames.length} frame${frames.length === 1 ? "" : "s"} checked, ` +
+      `markup ${describeCode(frame.code)}, ${bytes.length} bytes unchanged`,
+  );
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
+main().catch((err) => {
+  console.error(String(err.message ?? err));
   process.exitCode = 1;
 });
